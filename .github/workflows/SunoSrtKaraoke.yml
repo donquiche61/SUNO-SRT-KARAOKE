@@ -1,0 +1,353 @@
+// ==UserScript==
+// @name         Suno Karaoke SRT - Fixed Word Wrapping (Pixel-Perfect) (le 29/10/25 17h48)
+// @namespace    http://tampermonkey.net/
+// @version      3.0
+// @description  Karaoké et SRT sans troncature. Découpage par largeur réelle (pixels). Aucun mot coupé.
+// @author       donquiche
+// @match        https://suno.com/*
+// @match        https://www.suno.com/*
+// @grant        fork from 
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const cache = {};
+    let currentAlignedWords = null;
+    let karaokeInterval = null;
+    let lyricsDisplayElement = null;
+    let isKaraokeActive = false;
+    let measureCanvas = null;
+
+    function getCookie(name) {
+        const value = `; ${document.cookie}`;
+        const parts = value.split(`; ${name}=`);
+        if (parts.length === 2) return parts.pop().split(';').shift();
+    }
+
+    async function fetchAlignedWords(songId, token) {
+        if (cache[songId]) return cache[songId];
+        const apiUrl = `https://studio-api.prod.suno.com/api/gen/${songId}/aligned_lyrics/v2/`;
+        try {
+            const response = await fetch(apiUrl, {
+                method: 'GET',
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }
+            });
+            const data = await response.json();
+            if (data && (data.aligned_words || data.aligned_lyrics)) {
+                const result = data.aligned_lyrics || data.aligned_words;
+                cache[songId] = result;
+                return result;
+            } else return null;
+        } catch (e) { console.error("Erreur fetchAlignedWords:", e); return null; }
+    }
+
+    function getMainImageElement() {
+        const images = document.querySelectorAll('img.object-cover');
+        for (const img of images) {
+            const rect = img.getBoundingClientRect();
+            if (rect.width > 100 && rect.height > 100 &&
+                rect.top >= 0 && rect.left >= 0 &&
+                getComputedStyle(img).display !== 'none' &&
+                getComputedStyle(img).visibility !== 'hidden') {
+                return img;
+            }
+        }
+        return null;
+    }
+
+    // --- Mesure de largeur réelle ---
+    function getTextWidth(text, font) {
+        if (!measureCanvas) {
+            measureCanvas = document.createElement('canvas');
+        }
+        const context = measureCanvas.getContext('2d');
+        context.font = font;
+        return context.measureText(text).width;
+    }
+
+    function splitTextByWidth(text, maxWidth, font) {
+        if (!text) return [];
+        const words = text.split(' ');
+        const lines = [];
+        let currentLine = '';
+
+        for (const word of words) {
+            const testLine = currentLine ? currentLine + ' ' + word : word;
+            const width = getTextWidth(testLine, font);
+            if (width <= maxWidth) {
+                currentLine = testLine;
+            } else {
+                if (currentLine) lines.push(currentLine);
+                if (getTextWidth(word, font) > maxWidth) {
+                    // Mot trop long : le couper
+                    let part = '';
+                    for (const char of word) {
+                        const testPart = part + char;
+                        if (getTextWidth(testPart, font) > maxWidth) {
+                            if (part) lines.push(part);
+                            part = char;
+                        } else {
+                            part = testPart;
+                        }
+                    }
+                    if (part) currentLine = part;
+                    else currentLine = word;
+                } else {
+                    currentLine = word;
+                }
+            }
+        }
+        if (currentLine) lines.push(currentLine);
+        return lines;
+    }
+
+    function createLyricsOverlay(imageElement) {
+        const parent = imageElement.parentNode;
+        const existing = parent.querySelector('.suno-karaoke-overlay');
+        if (existing) existing.remove();
+
+        const overlay = document.createElement('div');
+        overlay.className = 'suno-karaoke-overlay';
+        Object.assign(overlay.style, {
+            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+            display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
+            padding: '20px', pointerEvents: 'none', zIndex: 10000,
+            opacity: 0, transition: 'opacity 0.3s ease-in-out'
+        });
+
+        const lyricsContainer = document.createElement('div');
+        lyricsContainer.className = 'karaoke-lyrics-container';
+        Object.assign(lyricsContainer.style, {
+            background: 'linear-gradient(to top, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0.7) 60%, rgba(0,0,0,0) 100%)',
+            width: '100%', maxWidth: '640px', margin: '0 auto',
+            padding: '30px 24px 16px', textAlign: 'center', backdropFilter: 'blur(3px)'
+        });
+
+        const lyricsText = document.createElement('div');
+        lyricsText.className = 'karaoke-lyrics-text';
+        Object.assign(lyricsText.style, {
+            fontSize: '20px', fontWeight: 'bold', color: 'white',
+            textShadow: '0 2px 10px rgba(0,0,0,1), 0 0 30px rgba(0,0,0,0.8)',
+            lineHeight: '1.4', transition: 'all 0.2s ease-out',
+            minHeight: '30px'
+        });
+
+        // Conteneur pour lignes avec nowrap
+        const linesWrapper = document.createElement('div');
+        linesWrapper.style.cssText = `
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+        `;
+
+        lyricsText.appendChild(linesWrapper);
+        lyricsContainer.appendChild(lyricsText);
+        overlay.appendChild(lyricsContainer);
+
+        if (window.getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+        parent.appendChild(overlay);
+
+        return { lyricsText, linesWrapper };
+    }
+
+    function stopKaraoke() {
+        if (karaokeInterval) clearInterval(karaokeInterval), karaokeInterval = null;
+        document.querySelectorAll('.suno-karaoke-overlay').forEach(overlay => {
+            overlay.style.opacity = '0';
+            setTimeout(() => { if (overlay.parentNode) overlay.remove(); }, 300);
+        });
+        lyricsDisplayElement = null; isKaraokeActive = false;
+        document.querySelectorAll('.my-suno-karaoke-button').forEach(btn => {
+            btn.innerText = `🎤`;
+            btn.style.background = 'rgba(33, 150, 243, 0.9)';
+            btn.title = `Karaoké`;
+        });
+    }
+
+    function startKaraoke(alignedLyricsData, imageElement) {
+        if (!alignedLyricsData || !Array.isArray(alignedLyricsData) || alignedLyricsData.length === 0) return stopKaraoke();
+
+        currentAlignedWords = alignedLyricsData;
+        const overlay = createLyricsOverlay(imageElement);
+        lyricsDisplayElement = overlay.lyricsText;
+        const linesWrapper = overlay.linesWrapper;
+        isKaraokeActive = true;
+
+        setTimeout(() => {
+            const ov = imageElement.parentNode.querySelector('.suno-karaoke-overlay');
+            if (ov) ov.style.opacity = '1';
+        }, 50);
+
+        let audioElement = document.querySelector('audio');
+        const containerWidth = () => {
+            const cont = imageElement.parentNode.querySelector('.karaoke-lyrics-container');
+            return cont ? cont.clientWidth - 48 : 500; // padding 24px ×2
+        };
+
+        function updateLyrics() {
+            if (!currentAlignedWords || !isKaraokeActive) return;
+            if (!audioElement || audioElement.paused || audioElement.ended || !document.body.contains(audioElement)) {
+                audioElement = document.querySelector('audio');
+                if (!audioElement) return;
+            }
+
+            let currentLyric = '';
+            const currentTime = audioElement.currentTime;
+
+            for (let i = 0; i < currentAlignedWords.length; i++) {
+                const line = currentAlignedWords[i];
+                const start = line.start_s;
+                const end = line.end_s ?? Infinity;
+                if (typeof start !== 'number') continue;
+
+                if (currentTime >= start && currentTime < end) {
+                    currentLyric = (line.text || '').replace(/\[.*?\]/g, '').trim();
+                    break;
+                }
+            }
+
+            if (!currentLyric && currentAlignedWords.length > 0) {
+                const last = currentAlignedWords[currentAlignedWords.length - 1];
+                if (currentTime >= (last.end_s ?? last.start_s)) {
+                    currentLyric = (last.text || '').replace(/\[.*?\]/g, '').trim();
+                }
+            }
+
+            if (currentLyric && lyricsDisplayElement) {
+                const fontSize = parseFloat(window.getComputedStyle(lyricsDisplayElement).fontSize) || 20;
+                const font = `bold ${fontSize}px ${window.getComputedStyle(lyricsDisplayElement).fontFamily}`;
+                const maxWidth = containerWidth();
+
+                const lines = splitTextByWidth(currentLyric, maxWidth, font);
+
+                // Nettoyer
+                linesWrapper.innerHTML = '';
+
+                lines.forEach(line => {
+                    const lineEl = document.createElement('div');
+                    lineEl.textContent = line;
+                    lineEl.style.cssText = `
+                        white-space: nowrap;
+                        overflow: hidden;
+                        text-overflow: ellipsis;
+                        max-width: 100%;
+                    `;
+                    linesWrapper.appendChild(lineEl);
+                });
+
+                // Animation
+                lyricsDisplayElement.style.transform = 'scale(1.05)';
+                lyricsDisplayElement.style.color = '#FFD700';
+                setTimeout(() => {
+                    if (lyricsDisplayElement) {
+                        lyricsDisplayElement.style.transform = 'scale(1)';
+                        lyricsDisplayElement.style.color = 'white';
+                    }
+                }, 150);
+            } else if (!currentLyric) {
+                linesWrapper.innerHTML = '';
+            }
+        }
+
+        karaokeInterval = setInterval(updateLyrics, 80);
+    }
+
+    // === Boutons (inchangés, sauf suppression références à splitLyricLine) ===
+    function addButtons(fetchedData) {
+        removeExistingButtons();
+        const imageElement = getMainImageElement();
+        if (!imageElement) return;
+
+        const parent = imageElement.parentNode;
+        if (!parent) return;
+        if (parent.querySelector('.my-suno-download-button, .my-suno-karaoke-button')) return;
+
+        if (window.getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+
+        const btnStyle = {
+            zIndex: '9999', position: 'absolute', right: '10px',
+            width: '36px', height: '36px', color: '#fff', border: 'none',
+            borderRadius: '50%', padding: '0', cursor: 'pointer', fontSize: '16px',
+            fontWeight: 'bold', transition: 'all 0.3s ease', display: 'flex',
+            alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 6px rgba(0,0,0,0.3)'
+        };
+
+        const downloadBtn = document.createElement('button');
+        downloadBtn.innerText = `📥`; downloadBtn.className = 'my-suno-download-button';
+        downloadBtn.title = `Télécharger SRT`;
+        Object.assign(downloadBtn.style, btnStyle, { top: '10px', background: 'rgba(76, 175, 80, 0.9)' });
+        downloadBtn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); downloadSRT(fetchedData); };
+        parent.appendChild(downloadBtn);
+
+        const karaokeBtn = document.createElement('button');
+        karaokeBtn.innerText = `🎤`; karaokeBtn.className = 'my-suno-karaoke-button';
+        karaokeBtn.title = `Karaoké`;
+        Object.assign(karaokeBtn.style, btnStyle, { top: '52px', background: 'rgba(33, 150, 243, 0.9)' });
+        karaokeBtn.onclick = (e) => {
+            e.preventDefault(); e.stopPropagation();
+            if (isKaraokeActive) {
+                stopKaraoke();
+            } else {
+                startKaraoke(fetchedData, imageElement);
+                karaokeBtn.innerText = `⏹️`;
+                karaokeBtn.style.background = 'rgba(244, 67, 54, 0.9)';
+                karaokeBtn.title = 'Arrêter';
+            }
+        };
+        parent.appendChild(karaokeBtn);
+    }
+
+    function removeExistingButtons() {
+        document.querySelectorAll('.my-suno-download-button, .my-suno-karaoke-button').forEach(b => b.remove());
+    }
+
+    function downloadSRT(data) {
+        if (!data || !data.length) return alert("Aucune donnée.");
+        let srt = ''; let i = 1;
+        data.forEach(line => {
+            const start = line.start_s;
+            if (typeof start !== 'number') return;
+            const end = (line.end_s && line.end_s > start) ? line.end_s : start + 2;
+            const text = (line.text || '').replace(/\[.*?\]/g, '').trim();
+            if (text) {
+                srt += `${i}\n${formatTime(start)} --> ${formatTime(end)}\n${text}\n\n`;
+                i++;
+            }
+        });
+        if (!srt) return alert("Échec SRT.");
+        const blob = new Blob([srt], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'lyrics.srt'; a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    function formatTime(sec) {
+        if (typeof sec !== 'number') return "00:00:00,000";
+        const d = new Date(0);
+        d.setMilliseconds(Math.max(0, sec) * 1000);
+        return `${String(d.getUTCHours()).padStart(2,0)}:${String(d.getUTCMinutes()).padStart(2,0)}:${String(d.getUTCSeconds()).padStart(2,0)},${String(d.getUTCMilliseconds()).padStart(3,0)}`;
+    }
+
+    async function main() {
+        const m = window.location.href.match(/\/song\/([^/?#]+)/);
+        const id = m ? m[1] : null;
+        if (!id) { stopKaraoke(); removeExistingButtons(); return; }
+
+        const token = getCookie('__session');
+        if (!token) { stopKaraoke(); removeExistingButtons(); return; }
+
+        const data = await fetchAlignedWords(id, token);
+        if (data) addButtons(data);
+        else { stopKaraoke(); removeExistingButtons(); }
+    }
+
+    setTimeout(main, 2000);
+    let url = location.href;
+    setInterval(() => {
+        if (location.href !== url) { url = location.href; stopKaraoke(); removeExistingButtons(); setTimeout(main, 2000); }
+    }, 1000);
+    window.addEventListener('beforeunload', stopKaraoke);
+})();
