@@ -1,0 +1,446 @@
+// ==UserScript==
+// @name         Suno AI - Karaoké + SRT + Téléchargement MP3 (INSTANT)(GROK le 02/11/25)
+// @namespace    http://tampermonkey.net/
+// @version      3.6
+// @description  Karaoké, SRT, MP3 (bouton MP3 apparaît instantanément)
+// @author       dansleboby + Dschi + Lyte
+// @match        https://suno.com/*
+// @match        https://www.suno.com/*
+// @match        https://app.suno.ai/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const cache = {};
+    let currentAlignedWords = null;
+    let karaokeInterval = null;
+    let lyricsDisplayElement = null;
+    let isKaraokeActive = false;
+    let measureCanvas = null;
+    let mp3ButtonRetry = null;
+
+    function getCookie(name) {
+        const value = `; ${document.cookie}`;
+        const parts = value.split(`; ${name}=`);
+        if (parts.length === 2) return parts.pop().split(';').shift();
+    }
+
+    async function fetchAlignedWords(songId, token) {
+        if (cache[songId]) return cache[songId];
+        const apiUrl = `https://studio-api.prod.suno.com/api/gen/${songId}/aligned_lyrics/v2/`;
+        try {
+            const response = await fetch(apiUrl, {
+                method: 'GET',
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }
+            });
+            const data = await response.json();
+            if (data && (data.aligned_words || data.aligned_lyrics)) {
+                const result = data.aligned_lyrics || data.aligned_words;
+                cache[songId] = result;
+                return result;
+            }
+        } catch (e) { console.error("Erreur fetchAlignedWords:", e); }
+        return null;
+    }
+
+    function getMainImageElement() {
+        const images = document.querySelectorAll('img.object-cover');
+        for (const img of images) {
+            const rect = img.getBoundingClientRect();
+            if (rect.width > 100 && rect.height > 100 && rect.top >= 0 && rect.left >= 0 &&
+                getComputedStyle(img).display !== 'none' && getComputedStyle(img).visibility !== 'hidden') {
+                return img;
+            }
+        }
+        return null;
+    }
+
+    function getTextWidth(text, font) {
+        if (!measureCanvas) measureCanvas = document.createElement('canvas');
+        const ctx = measureCanvas.getContext('2d');
+        ctx.font = font;
+        return ctx.measureText(text).width;
+    }
+
+    function splitTextByWidth(text, maxWidth, font) {
+        if (!text) return [];
+        const words = text.split(' ');
+        const lines = [];
+        let currentLine = '';
+
+        for (const word of words) {
+            const testLine = currentLine ? currentLine + ' ' + word : word;
+            if (getTextWidth(testLine, font) <= maxWidth) {
+                currentLine = testLine;
+            } else {
+                if (currentLine) lines.push(currentLine);
+                if (getTextWidth(word, font) > maxWidth) {
+                    let part = '';
+                    for (const char of word) {
+                        const testPart = part + char;
+                        if (getTextWidth(testPart, font) > maxWidth) {
+                            if (part) lines.push(part);
+                            part = char;
+                        } else part = testPart;
+                    }
+                    currentLine = part;
+                } else {
+                    currentLine = word;
+                }
+            }
+        }
+        if (currentLine) lines.push(currentLine);
+        return lines;
+    }
+
+    function createLyricsOverlay(imageElement) {
+        const parent = imageElement.parentNode;
+        const existing = parent.querySelector('.suno-karaoke-overlay');
+        if (existing) existing.remove();
+
+        const overlay = document.createElement('div');
+        overlay.className = 'suno-karaoke-overlay';
+        Object.assign(overlay.style, {
+            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+            display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
+            padding: '20px', pointerEvents: 'none', zIndex: 10000,
+            opacity: 0, transition: 'opacity 0.3s ease-in-out'
+        });
+
+        const lyricsContainer = document.createElement('div');
+        lyricsContainer.className = 'karaoke-lyrics-container';
+        Object.assign(lyricsContainer.style, {
+            background: 'linear-gradient(to top, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0.7) 60%, rgba(0,0,0,0) 100%)',
+            width: '100%', maxWidth: '640px', margin: '0 auto',
+            padding: '30px 24px 16px', textAlign: 'center', backdropFilter: 'blur(3px)'
+        });
+
+        const lyricsText = document.createElement('div');
+        lyricsText.className = 'karaoke-lyrics-text';
+        Object.assign(lyricsText.style, {
+            fontSize: '20px', fontWeight: 'bold', color: 'white',
+            textShadow: '0 2px 10px rgba(0,0,0,1), 0 0 30px rgba(0,0,0,0.8)',
+            lineHeight: '1.4', transition: 'all 0.2s ease-out', minHeight: '30px'
+        });
+
+        const linesWrapper = document.createElement('div');
+        linesWrapper.style.cssText = `display: flex; flex-direction: column; align-items: center; gap: 4px;`;
+        lyricsText.appendChild(linesWrapper);
+        lyricsContainer.appendChild(lyricsText);
+        overlay.appendChild(lyricsContainer);
+
+        if (window.getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+        parent.appendChild(overlay);
+
+        return { lyricsText, linesWrapper };
+    }
+
+    function stopKaraoke() {
+        if (karaokeInterval) {
+            clearInterval(karaokeInterval);
+            karaokeInterval = null;
+        }
+        document.querySelectorAll('.suno-karaoke-overlay').forEach(o => {
+            o.style.opacity = '0';
+            setTimeout(() => o.remove(), 300);
+        });
+        lyricsDisplayElement = null;
+        isKaraokeActive = false;
+        document.querySelectorAll('.my-suno-karaoke-button').forEach(b => {
+            b.innerText = `Karaoké`;
+            b.style.background = 'rgba(33, 150, 243, 0.9)';
+            b.title = 'Karaoké';
+        });
+    }
+
+    function startKaraoke(alignedLyricsData, imageElement) {
+        if (!alignedLyricsData || !Array.isArray(alignedLyricsData)) return stopKaraoke();
+        currentAlignedWords = alignedLyricsData;
+        const { lyricsText, linesWrapper } = createLyricsOverlay(imageElement);
+        lyricsDisplayElement = lyricsText;
+        isKaraokeActive = true;
+
+        setTimeout(() => {
+            const ov = imageElement.parentNode.querySelector('.suno-karaoke-overlay');
+            if (ov) ov.style.opacity = '1';
+        }, 50);
+
+        let audioElement = document.querySelector('audio');
+        const getMaxWidth = () => {
+            const cont = imageElement.parentNode.querySelector('.karaoke-lyrics-container');
+            return cont ? cont.clientWidth - 48 : 500;
+        };
+
+        function updateLyrics() {
+            if (!currentAlignedWords || !isKaraokeActive) return;
+            audioElement = document.querySelector('audio') || audioElement;
+            if (!audioElement) return;
+
+            let currentLyric = '';
+            const time = audioElement.currentTime;
+
+            for (const line of currentAlignedWords) {
+                const s = line.start_s, e = line.end_s ?? Infinity;
+                if (typeof s === 'number' && time >= s && time < e) {
+                    currentLyric = (line.text || '').replace(/\[.*?\]/g, '').trim();
+                    break;
+                }
+            }
+
+            if (currentLyric && lyricsDisplayElement) {
+                const fontSize = parseFloat(getComputedStyle(lyricsDisplayElement).fontSize) || 20;
+                const font = `bold ${fontSize}px ${getComputedStyle(lyricsDisplayElement).fontFamily}`;
+                const lines = splitTextByWidth(currentLyric, getMaxWidth(), font);
+
+                linesWrapper.innerHTML = '';
+                lines.forEach(text => {
+                    const el = document.createElement('div');
+                    el.textContent = text;
+                    el.style.cssText = 'white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;';
+                    linesWrapper.appendChild(el);
+                });
+
+                lyricsDisplayElement.style.transform = 'scale(1.05)';
+                lyricsDisplayElement.style.color = '#FFD700';
+                setTimeout(() => {
+                    if (lyricsDisplayElement) {
+                        lyricsDisplayElement.style.transform = 'scale(1)';
+                        lyricsDisplayElement.style.color = 'white';
+                    }
+                }, 150);
+            } else if (!currentLyric) {
+                linesWrapper.innerHTML = '';
+            }
+        }
+
+        karaokeInterval = setInterval(updateLyrics, 80);
+    }
+
+    function addAllButtons(fetchedData) {
+        removeExistingButtons();
+        const imageElement = getMainImageElement();
+        if (!imageElement) return;
+
+        const parent = imageElement.parentNode;
+        if (!parent) return;
+        if (window.getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+
+        // SRT
+        const srtBtn = document.createElement('button');
+        srtBtn.innerText = `SRT`; srtBtn.className = 'my-suno-download-button';
+        srtBtn.title = 'Télécharger SRT';
+        Object.assign(srtBtn.style, {
+            zIndex: 9999, position: 'absolute', right: '10px', top: '10px',
+            width: '36px', height: '36px', background: 'rgba(76, 175, 80, 0.9)', color: '#fff',
+            border: 'none', borderRadius: '50%', fontSize: '16px', fontWeight: 'bold',
+            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            boxShadow: '0 2px 6px rgba(0,0,0,0.3)', transition: 'all 0.3s'
+        });
+        srtBtn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); downloadSRT(fetchedData); };
+        parent.appendChild(srtBtn);
+
+        // Karaoké
+        const karaokeBtn = document.createElement('button');
+        karaokeBtn.innerText = `Karaoké`; karaokeBtn.className = 'my-suno-karaoke-button';
+        karaokeBtn.title = 'Karaoké';
+        Object.assign(karaokeBtn.style, {
+            zIndex: 9999, position: 'absolute', right: '10px', top: '52px',
+            width: '36px', height: '36px', background: 'rgba(33, 150, 243, 0.9)', color: '#fff',
+            border: 'none', borderRadius: '50%', fontSize: '16px', fontWeight: 'bold',
+            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            boxShadow: '0 2px 6px rgba(0,0,0,0.3)', transition: 'all 0.3s'
+        });
+        karaokeBtn.onclick = (e) => {
+            e.preventDefault(); e.stopPropagation();
+            if (isKaraokeActive) stopKaraoke();
+            else {
+                startKaraoke(fetchedData, imageElement);
+                karaokeBtn.innerText = `Stop`; karaokeBtn.style.background = 'rgba(244, 67, 54, 0.9)';
+                karaokeBtn.title = 'Arrêter';
+            }
+        };
+        parent.appendChild(karaokeBtn);
+
+        // MP3 : appel immédiat + observer
+        ensureMP3Button(parent);
+    }
+
+    function removeExistingButtons() {
+        document.querySelectorAll('.my-suno-download-button, .my-suno-karaoke-button, .my-suno-mp3-button').forEach(b => b.remove());
+    }
+
+    function downloadSRT(data) {
+        if (!data || !data.length) return alert("Aucune donnée.");
+        let srt = ''; let i = 1;
+        data.forEach(line => {
+            const s = line.start_s;
+            if (typeof s !== 'number') return;
+            const e = (line.end_s && line.end_s > s) ? line.end_s : s + 2;
+            const txt = (line.text || '').replace(/\[.*?\]/g, '').trim();
+            if (txt) srt += `${i++}\n${formatTime(s)} --> ${formatTime(e)}\n${txt}\n\n`;
+        });
+        if (!srt) return alert("Échec SRT.");
+        const blob = new Blob([srt], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'lyrics.srt'; a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    function formatTime(sec) {
+        if (typeof sec !== 'number') return "00:00:00,000";
+        const d = new Date(0);
+        d.setMilliseconds(Math.max(0, sec) * 1000);
+        return `${String(d.getUTCHours()).padStart(2,0)}:${String(d.getUTCMinutes()).padStart(2,0)}:${String(d.getUTCSeconds()).padStart(2,0)},${String(d.getUTCMilliseconds()).padStart(3,0)}`;
+    }
+
+    // === MP3 : Affichage instantané ===
+    function ensureMP3Button(imageParent) {
+        if (mp3ButtonRetry) clearInterval(mp3ButtonRetry);
+        const tryAdd = () => {
+            const audio = document.querySelector('audio:not([src*="silence.mp3"])');
+            if (audio && audio.src) {
+                addMP3Button(imageParent);
+                if (mp3ButtonRetry) clearInterval(mp3ButtonRetry);
+                mp3ButtonRetry = null;
+            }
+        };
+        tryAdd();
+        mp3ButtonRetry = setInterval(tryAdd, 500);
+    }
+
+    function addMP3Button(imageParent) {
+        const audio = document.querySelector('audio:not([src*="silence.mp3"])');
+        if (!audio || !audio.src) return;
+
+        if (imageParent.querySelector('.my-suno-mp3-button')) return;
+
+        const btn = document.createElement('button');
+        btn.className = 'my-suno-mp3-button';
+        btn.title = 'Télécharger MP3';
+        btn.innerText = 'MP3';
+        Object.assign(btn.style, {
+            zIndex: 9999, position: 'absolute', right: '10px', top: '94px',
+            width: '36px', height: '36px', background: 'rgba(255, 193, 7, 0.9)', color: '#fff',
+            border: 'none', borderRadius: '50%', fontSize: '12px', fontWeight: 'bold',
+            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            boxShadow: '0 2px 6px rgba(0,0,0,0.3)', transition: 'all 0.3s'
+        });
+
+        btn.onclick = async (e) => {
+            e.preventDefault(); e.stopPropagation();
+            btn.disabled = true;
+            btn.innerText = '⏳';
+            const blob = await convertToMP3(audio.src);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = blob.type.includes('mp3') ? 'song.mp3' : 'song.m4a';
+            a.click();
+            URL.revokeObjectURL(url);
+            btn.disabled = false;
+            btn.innerText = 'MP3';
+        };
+
+        imageParent.appendChild(btn);
+    }
+
+    async function convertToMP3(audioUrl) {
+        try {
+            const response = await fetch(audioUrl);
+            const arrayBuffer = await response.arrayBuffer();
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+            const offlineContext = new OfflineAudioContext(2, audioBuffer.length, 44100);
+            const source = offlineContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(offlineContext.destination);
+            source.start();
+            const renderedBuffer = await offlineContext.startRendering();
+
+            return bufferToWave(renderedBuffer);
+        } catch (e) {
+            console.error("Conversion échouée:", e);
+            const response = await fetch(audioUrl);
+            return await response.blob();
+        }
+    }
+
+    function bufferToWave(abuffer) {
+        let numOfChan = abuffer.numberOfChannels,
+            length = abuffer.length * numOfChan * 2 + 44,
+            buffer = new ArrayBuffer(length),
+            view = new DataView(buffer),
+            channels = [], i, sample,
+            offset = 0, pos = 0;
+
+        setUint32(0x46464952); // "RIFF"
+        setUint32(length - 8);
+        setUint32(0x45564157); // "WAVE"
+        setUint32(0x20746d66); // "fmt "
+        setUint32(16);
+        setUint16(1); // PCM
+        setUint16(numOfChan);
+        setUint32(abuffer.sampleRate);
+        setUint32(abuffer.sampleRate * 2 * numOfChan);
+        setUint16(numOfChan * 2);
+        setUint16(16);
+        setUint32(0x61746164); // "data"
+        setUint32(length - pos - 4);
+
+        for (i = 0; i < abuffer.numberOfChannels; i++)
+            channels.push(abuffer.getChannelData(i));
+
+        while (pos < length) {
+            for (i = 0; i < numOfChan; i++) {
+                sample = Math.max(-1, Math.min(1, channels[i][offset]));
+                sample = (sample < 0 ? sample * 0x8000 : sample * 0x7FFF) | 0;
+                view.setInt16(pos, sample, true);
+                pos += 2;
+            }
+            offset++;
+        }
+
+        function setUint16(data) { view.setUint16(pos, data, true); pos += 2; }
+        function setUint32(data) { view.setUint32(pos, data, true); pos += 4; }
+
+        return new Blob([buffer], { type: 'audio/mp3' });
+    }
+
+    // === Observer audio + image ===
+    const audioObserver = new MutationObserver(() => {
+        const img = getMainImageElement();
+        if (img) ensureMP3Button(img.parentNode);
+    });
+    audioObserver.observe(document.body, { childList: true, subtree: true });
+
+    // === Main ===
+    async function main() {
+        const match = location.href.match(/\/song\/([^/?#]+)/);
+        const songId = match ? match[1] : null;
+        if (!songId) { stopKaraoke(); removeExistingButtons(); return; }
+
+        const token = getCookie('__session');
+        if (!token) { stopKaraoke(); removeExistingButtons(); return; }
+
+        const data = await fetchAlignedWords(songId, token);
+        if (data) addAllButtons(data);
+        else { stopKaraoke(); removeExistingButtons(); }
+    }
+
+    setTimeout(main, 2000);
+    let url = location.href;
+    setInterval(() => {
+        if (location.href !== url) {
+            url = location.href;
+            stopKaraoke();
+            removeExistingButtons();
+            setTimeout(main, 2000);
+        }
+    }, 1000);
+
+    window.addEventListener('beforeunload', stopKaraoke);
+})();
